@@ -367,3 +367,31 @@ int io_uring_register_file_alloc_range(struct io_uring *ring,
 				       IORING_REGISTER_FILE_ALLOC_RANGE, &range,
 				       0);
 }
+
+#if 1 /* XXX temp development hack */
+#define IORING_REGISTER_IFQ		26
+
+struct io_uring_ifq_req {
+	__u32	ifindex;
+	__u16	queue_id;
+	__u16	ifq_id;
+	__u16	fill_bgid;
+	__u16	region_id;
+	__u16	__pad[2];
+};
+#endif
+
+int io_uring_register_ifq(struct io_uring *ring, int ifindex, __u16 queue_id,
+			  __u16 ifq_id, __u16 bgid, __u16 region_id)
+{
+	struct io_uring_ifq_req reg = {
+		.ifindex = ifindex,
+		.queue_id = queue_id,
+		.fill_bgid = bgid,
+	};
+	int ret;
+
+	ret = __sys_io_uring_register(ring->ring_fd, IORING_REGISTER_IFQ,
+				      &reg, 1);
+	return ret;
+}

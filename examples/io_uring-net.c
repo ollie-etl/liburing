@@ -485,19 +485,22 @@ static void hold_fill(struct ctx *ctx, int idx)
 	hold->buf[hold->count++] = idx;
 }
 
-static void clear_fill(struct ctx *ctx, int space)
+static void clear_fill(struct ctx *ctx, struct io_uring_cqe *cqe)
 {
-	struct hold *hold;
+	int avail = cqe->res & 0xffff;
 	int i, count, holdidx, idx;
+	struct hold *hold;
+	void *addr;
 
 	if (ctx->verbose)
-		printf("more space available: %d\n", space);
+		printf("clear fill:%llx flags:%x res:%x avail:%d\n",
+			cqe->user_data, cqe->flags, cqe->res, avail);
 
-	if (!space) {
+	if (!avail) {
 		printf("driver stalled - no buffers available\n");
 		return;
 	}
-	ctx->fillq_avail += space;
+	ctx->fillq_avail += avail;
 
 retry:
 	hold = g_hold;
@@ -520,8 +523,9 @@ retry:
 			exit(1);
 		}
 		uref[idx]--;
+		addr = (void *)(long)((BGID_ZC_REGION << 16) | idx);
 		io_uring_buf_ring_add(ctx->fillq,
-			(void *)(long)idx, PAGE_SIZE, idx,
+			addr, PAGE_SIZE, idx,
 			io_uring_buf_ring_mask(FILL_QUEUE_ENTRIES), i);
 	}
 	io_uring_buf_ring_advance(ctx->fillq, count);
@@ -639,12 +643,12 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 			cqe->flags, cqe->res, cqe->user_data);
 
 	if (!cqe->user_data && !cqe->flags) {
-		printf("BAD CQE, ignoring.\n");
+//		printf("BAD CQE, ignoring.\n");
 		return 0;
 	}
 
 	if (cqe->flags & IORING_CQE_F_NOTIF) {
-		clear_fill(ctx, cqe->res & 0xffff);
+		clear_fill(ctx, cqe);
 		return 0;
 	}
 
@@ -856,7 +860,7 @@ io_zctap_ifq(struct ctx *ctx)
 		fprintf(stderr, "register_ifq failed: %s\n", strerror(-ret));
 		return -1;
 	}
-	fprintf(stderr, "registered ifq:%d, r=%d\n", qid, ret);
+	fprintf(stderr, "registered ifq:%d\n", qid);
 	return ret;
 }
 

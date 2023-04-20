@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <error.h>
-#include <openssl/md5.h>
 
 #include "liburing.h"
 
@@ -73,10 +72,8 @@ struct ctx {
 	int fillq_avail;
 	int region_pages;
 	bool udp;
-	bool use_md5;
 	char *ifname;
 	char *outfile;
-	MD5_CTX md5;
 	struct sendmsg_ctx send[BUFFERS];
 	size_t buf_ring_size;
 	size_t fillq_size;
@@ -728,8 +725,6 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 				hex_dump(addr, zov[i].len, i);
 			if (ctx->outfile)
 				write(ctx->out_fd, addr, zov[i].len);
-			if (ctx->use_md5)
-				MD5_Update(&ctx->md5, addr, zov[i].len);
 
 			bufid = zov[i].bid;
 			if (zov[i].bgid == BGID_COPY_RING) {
@@ -1028,10 +1023,6 @@ int main(int argc, char *argv[])
 		case 'i':
 			ctx.ifname = optarg;
 			break;
-		case 'm':
-			ctx.use_md5 = true;
-			MD5_Init(&ctx.md5);
-			break;
 		case 'p':
 			port = atoi(optarg);
 			break;
@@ -1140,17 +1131,6 @@ int main(int argc, char *argv[])
 	}
 
 cleanup:
-	if (ctx.use_md5) {
-		unsigned char md5[MD5_DIGEST_LENGTH];
-		char buf[40];
-		int i, pos;
-
-		MD5_Final(md5, &ctx.md5);
-		pos = sprintf(buf, "md5: ");
-		for (i = 0; i < MD5_DIGEST_LENGTH; i++)
-			pos += sprintf(&buf[pos], "%02x", md5[i]);
-		printf("%s\n", buf);
-	}
 	stats(&ctx, start);
 	cleanup_context(&ctx);
 	close(sockfd);

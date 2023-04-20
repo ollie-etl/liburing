@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <assert.h>
 #include <errno.h>
-#include <error.h>
 #include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,7 +11,6 @@
 #include <string.h>
 
 #include <arpa/inet.h>
-#include <linux/errqueue.h>
 #include <linux/if_packet.h>
 #include <linux/ipv6.h>
 #include <linux/socket.h>
@@ -34,13 +32,14 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <linux/mman.h>
 
 #include "liburing.h"
 #include "helpers.h"
 
 #define MAX_MSG	128
 
-#define PORT	10200
 #define HOST	"127.0.0.1"
 #define HOSTV6	"::1"
 
@@ -58,10 +57,17 @@ enum {
 	BUF_T_SMALL,
 	BUF_T_NONALIGNED,
 	BUF_T_LARGE,
+	BUF_T_HUGETLB,
+
+	__BUF_NR,
 };
 
+/* 32MB, should be enough to trigger a short send */
+#define LARGE_BUF_SIZE		(1U << 25)
+
+static size_t page_sz;
 static char *tx_buffer, *rx_buffer;
-static struct iovec buffers_iov[4];
+static struct iovec buffers_iov[__BUF_NR];
 static bool has_sendmsg;
 
 static bool check_cq_empty(struct io_uring *ring)
@@ -190,10 +196,9 @@ static int create_socketpair_ip(struct sockaddr_storage *addr,
 				bool ipv6, bool client_connect,
 				bool msg_zc, bool tcp)
 {
-	int family, addr_size;
-	int ret, val;
-	int listen_sock = -1;
-	int sock;
+	socklen_t addr_size;
+	int family, sock, listen_sock = -1;
+	int ret;
 
 	memset(addr, 0, sizeof(*addr));
 	if (ipv6) {
@@ -201,14 +206,14 @@ static int create_socketpair_ip(struct sockaddr_storage *addr,
 
 		family = AF_INET6;
 		saddr->sin6_family = family;
-		saddr->sin6_port = htons(PORT);
+		saddr->sin6_port = htons(0);
 		addr_size = sizeof(*saddr);
 	} else {
 		struct sockaddr_in *saddr = (struct sockaddr_in *)addr;
 
 		family = AF_INET;
 		saddr->sin_family = family;
-		saddr->sin_port = htons(PORT);
+		saddr->sin_port = htons(0);
 		saddr->sin_addr.s_addr = htonl(INADDR_ANY);
 		addr_size = sizeof(*saddr);
 	}
@@ -223,16 +228,19 @@ static int create_socketpair_ip(struct sockaddr_storage *addr,
 		perror("socket");
 		return 1;
 	}
-	val = 1;
-	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-	val = 1;
-	setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
 
 	ret = bind(sock, (struct sockaddr *)addr, addr_size);
 	if (ret < 0) {
 		perror("bind");
 		return 1;
 	}
+
+	ret = getsockname(sock, (struct sockaddr *)addr, &addr_size);
+	if (ret < 0) {
+		fprintf(stderr, "getsockname failed %i\n", errno);
+		return 1;
+	}
+
 	if (tcp) {
 		ret = listen(sock, 128);
 		assert(ret != -1);
@@ -267,11 +275,17 @@ static int create_socketpair_ip(struct sockaddr_storage *addr,
 		}
 	}
 	if (msg_zc) {
-		val = 1;
+#ifdef SO_ZEROCOPY
+		int val = 1;
+
 		if (setsockopt(*sock_client, SOL_SOCKET, SO_ZEROCOPY, &val, sizeof(val))) {
 			perror("setsockopt zc");
 			return 1;
 		}
+#else
+		fprintf(stderr, "no SO_ZEROCOPY\n");
+		return 1;
+#endif
 	}
 	if (tcp) {
 		*sock_server = accept(listen_sock, NULL, NULL);
@@ -432,7 +446,8 @@ static int do_test_inet_send(struct io_uring *ring, int sock_client, int sock_se
 		}
 		if (cqe->user_data == RX_TAG) {
 			if (cqe->res != send_size) {
-				fprintf(stderr, "rx failed %i\n", cqe->res);
+				fprintf(stderr, "rx failed res: %i, expected %i\n",
+						cqe->res, (int)send_size);
 				return 1;
 			}
 			io_uring_cqe_seen(ring, cqe);
@@ -478,6 +493,7 @@ static int test_inet_send(struct io_uring *ring)
 	struct sockaddr_storage addr;
 	int sock_client = -1, sock_server = -1;
 	int ret, j, i;
+	int buf_index;
 
 	for (j = 0; j < 32; j++) {
 		bool ipv6 = j & 1;
@@ -490,7 +506,10 @@ static int test_inet_send(struct io_uring *ring)
 			continue;
 		if (swap_sockets && !tcp)
 			continue;
-
+#ifndef SO_ZEROCOPY
+		if (msg_zc_set)
+			continue;
+#endif
 		ret = create_socketpair_ip(&addr, &sock_client, &sock_server, ipv6,
 				 client_connect, msg_zc_set, tcp);
 		if (ret) {
@@ -504,20 +523,19 @@ static int test_inet_send(struct io_uring *ring)
 			sock_server = tmp_sock;
 		}
 
-		for (i = 0; i < 4096; i++) {
+		for (i = 0; i < 1024; i++) {
 			bool regbuf;
 
-			conf.buf_index = i & 3;
+			conf.use_sendmsg = i & 1;
+			conf.poll_first = i & 2;
 			conf.fixed_buf = i & 4;
 			conf.addr = (i & 8) ? &addr : NULL;
 			conf.cork = i & 16;
 			conf.mix_register = i & 32;
 			conf.force_async = i & 64;
-			conf.use_sendmsg = i & 128;
-			conf.zc = i & 256;
-			conf.iovec = i & 512;
-			conf.long_iovec = i & 1024;
-			conf.poll_first = i & 2048;
+			conf.zc = i & 128;
+			conf.iovec = i & 256;
+			conf.long_iovec = i & 512;
 			conf.tcp = tcp;
 			regbuf = conf.mix_register || conf.fixed_buf;
 
@@ -533,10 +551,6 @@ static int test_inet_send(struct io_uring *ring)
 				if (conf.addr && !has_sendmsg)
 					continue;
 			}
-			if (conf.buf_index == BUF_T_LARGE && !tcp)
-				continue;
-			if (!buffers_iov[conf.buf_index].iov_base)
-				continue;
 			if (tcp && (conf.cork || conf.addr))
 				continue;
 			if (conf.mix_register && (!conf.cork || conf.fixed_buf))
@@ -548,13 +562,23 @@ static int test_inet_send(struct io_uring *ring)
 			if (msg_zc_set && !conf.zc)
 				continue;
 
-			ret = do_test_inet_send(ring, sock_client, sock_server, &conf);
-			if (ret) {
-				fprintf(stderr, "send failed fixed buf %i, conn %i, addr %i, "
-					"cork %i\n",
-					conf.fixed_buf, client_connect, !!conf.addr,
-					conf.cork);
-				return 1;
+			for (buf_index = 0; buf_index < ARRAY_SIZE(buffers_iov); buf_index++) {
+				size_t len = buffers_iov[buf_index].iov_len;
+
+				if (!buffers_iov[buf_index].iov_base)
+					continue;
+				if (!tcp && len > 4 * page_sz)
+					continue;
+
+				conf.buf_index = buf_index;
+				ret = do_test_inet_send(ring, sock_client, sock_server, &conf);
+				if (ret) {
+					fprintf(stderr, "send failed fixed buf %i, "
+							"conn %i, addr %i, cork %i\n",
+						conf.fixed_buf, client_connect,
+						!!conf.addr, conf.cork);
+					return 1;
+				}
 			}
 		}
 
@@ -704,6 +728,8 @@ int main(int argc, char *argv[])
 	if (argc > 1)
 		return T_EXIT_SKIP;
 
+	page_sz = sysconf(_SC_PAGESIZE);
+
 	/* create TCP IPv6 pair */
 	ret = create_socketpair_ip(&addr, &sp[0], &sp[1], true, true, false, true);
 	if (ret) {
@@ -711,34 +737,26 @@ int main(int argc, char *argv[])
 		return T_EXIT_FAIL;
 	}
 
-	len = 1U << 25; /* 32MB, should be enough to trigger a short send */
-	tx_buffer = aligned_alloc(4096, len);
-	rx_buffer = aligned_alloc(4096, len);
+	len = LARGE_BUF_SIZE;
+	tx_buffer = aligned_alloc(page_sz, len);
+	rx_buffer = aligned_alloc(page_sz, len);
 	if (tx_buffer && rx_buffer) {
 		buffers_iov[BUF_T_LARGE].iov_base = tx_buffer;
 		buffers_iov[BUF_T_LARGE].iov_len = len;
 	} else {
+		if (tx_buffer)
+			free(tx_buffer);
+		if (rx_buffer)
+			free(rx_buffer);
+
 		printf("skip large buffer tests, can't alloc\n");
 
-		len = 8192;
-		tx_buffer = aligned_alloc(4096, len);
-		rx_buffer = aligned_alloc(4096, len);
+		len = 2 * page_sz;
+		tx_buffer = aligned_alloc(page_sz, len);
+		rx_buffer = aligned_alloc(page_sz, len);
 	}
 	if (!tx_buffer || !rx_buffer) {
 		fprintf(stderr, "can't allocate buffers\n");
-		return T_EXIT_FAIL;
-	}
-
-	buffers_iov[BUF_T_NORMAL].iov_base = tx_buffer + 4096;
-	buffers_iov[BUF_T_NORMAL].iov_len = 4096;
-	buffers_iov[BUF_T_SMALL].iov_base = tx_buffer;
-	buffers_iov[BUF_T_SMALL].iov_len = 137;
-	buffers_iov[BUF_T_NONALIGNED].iov_base = tx_buffer + BUFFER_OFFSET;
-	buffers_iov[BUF_T_NONALIGNED].iov_len = 8192 - BUFFER_OFFSET - 13;
-
-	ret = io_uring_queue_init(32, &ring, 0);
-	if (ret) {
-		fprintf(stderr, "queue init failed: %d\n", ret);
 		return T_EXIT_FAIL;
 	}
 
@@ -746,6 +764,33 @@ int main(int argc, char *argv[])
 	for (i = 0; i < len; i++)
 		tx_buffer[i] = i;
 	memset(rx_buffer, 0, len);
+
+	buffers_iov[BUF_T_NORMAL].iov_base = tx_buffer + page_sz;
+	buffers_iov[BUF_T_NORMAL].iov_len = page_sz;
+	buffers_iov[BUF_T_SMALL].iov_base = tx_buffer;
+	buffers_iov[BUF_T_SMALL].iov_len = 137;
+	buffers_iov[BUF_T_NONALIGNED].iov_base = tx_buffer + BUFFER_OFFSET;
+	buffers_iov[BUF_T_NONALIGNED].iov_len = 2 * page_sz - BUFFER_OFFSET - 13;
+
+	if (len == LARGE_BUF_SIZE) {
+		void *huge_page;
+		int off = page_sz + 27;
+
+		len = 1U << 22;
+		huge_page = mmap(NULL, len, PROT_READ|PROT_WRITE,
+				 MAP_PRIVATE | MAP_HUGETLB | MAP_HUGE_2MB | MAP_ANONYMOUS,
+				 -1, 0);
+		if (huge_page != MAP_FAILED) {
+			buffers_iov[BUF_T_HUGETLB].iov_base = huge_page + off;
+			buffers_iov[BUF_T_HUGETLB].iov_len = len - off;
+		}
+	}
+
+	ret = io_uring_queue_init(32, &ring, 0);
+	if (ret) {
+		fprintf(stderr, "queue init failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
 
 	ret = test_basic_send(&ring, sp[0], sp[1]);
 	if (ret == T_EXIT_SKIP)
@@ -785,6 +830,15 @@ int main(int argc, char *argv[])
 	} else if (ret != T_SETUP_OK) {
 		fprintf(stderr, "buffer registration failed %i\n", ret);
 		return T_EXIT_FAIL;
+	}
+
+	if (buffers_iov[BUF_T_HUGETLB].iov_base) {
+		buffers_iov[BUF_T_HUGETLB].iov_base += 13;
+		buffers_iov[BUF_T_HUGETLB].iov_len -= 26;
+	}
+	if (buffers_iov[BUF_T_LARGE].iov_base) {
+		buffers_iov[BUF_T_LARGE].iov_base += 13;
+		buffers_iov[BUF_T_LARGE].iov_len -= 26;
 	}
 
 	ret = test_inet_send(&ring);
